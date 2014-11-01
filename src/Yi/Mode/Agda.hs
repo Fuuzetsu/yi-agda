@@ -46,7 +46,7 @@ data Agda = Agda { _stdIn ∷ Handle
 type Message = Tx.Text
 type Line = Int
 type Col = Int
-data InfoType = TypeChecking | Error | Goals
+data InfoType = TypeChecking | Error | Goals | CurrentGoal
               | Other Tx.Text deriving (Show, Eq)
 
 data IdentifierInfo = Keyword | Symbol | PrimitiveType
@@ -147,6 +147,7 @@ command = skippingPrompt *> cmds <|> parseFailure
               TypeChecking <$ "*Type-checking*"
               <|> Error <$ "*Error*"
               <|> Goals <$ "*All Goals*"
+              <|> CurrentGoal <$ "*Current Goal*"
               <|> Other <$> takeWhile (/= '"')
 
     hlClear = HighlightClear <$ "agda2-highlight-clear"
@@ -191,22 +192,43 @@ test ∷ IO ()
 test = do
   ag ← runAgda >>= threaded parser
   send ag $ loadCmd testFile []
+  send ag $ goalTypeCmd testFile 0
   threadDelay 3000000
   void $ killAgda ag
 
 data Activity = Interactive | NonInteractive deriving (Show, Eq)
 data Way = Indirect | Direct deriving (Show, Eq)
+data Complexity = Simplified deriving (Show, Eq)
 
 data IOTCM = IOTCM FilePath Activity Way Cmd
   deriving (Show, Eq)
 
+--IOTCM "{{filepath}}" NonInteractive Indirect ( Cmd_goal_type Simplified {{goalIndex}} noRange "" )
+
 send ∷ Agda → IOTCM → IO ()
-send a = hPutStrLn (_stdIn a) . show
+send a = sendRaw a . serialise
+
+sendRaw ∷ Agda → String → IO ()
+sendRaw a = hPutStrLn (_stdIn a)
 
 data Cmd where
   Cmd_load ∷ FilePath → [FilePath] → Cmd
+  Cmd_goal_type ∷ Complexity → Int → Cmd
   deriving (Show, Eq)
+
+serialise ∷ IOTCM → String
+serialise fc@(IOTCM fp act w c) = case c of
+  Cmd_load _ _ → show fc
+  Cmd_goal_type cmp i → unwords ["IOTCM", show fp, show act, show w
+                                , "(Cmd_goal_type", show cmp, show i
+                                , "noRange", "\"\")"
+                                ]
+
 
 loadCmd ∷ FilePath → [FilePath] → IOTCM
 loadCmd fp fps = IOTCM fp NonInteractive Indirect (Cmd_load fp $ "." : fps)
---IOTCM "{{filepath}}" NonInteractive Indirect ( Cmd_goal_type Simplified {{goalIndex}} noRange "" )
+
+goalTypeCmd ∷ FilePath
+            → Int -- ^ Goal index
+            → IOTCM
+goalTypeCmd fp i = IOTCM fp NonInteractive Indirect (Cmd_goal_type Simplified i)
