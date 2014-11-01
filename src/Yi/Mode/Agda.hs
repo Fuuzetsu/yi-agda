@@ -16,15 +16,15 @@
 
 module Yi.Mode.Agda where
 
-import Data.Monoid
-import GHC.IO.Exception (ExitCode(..))
 import           Control.Applicative
 import           Control.Concurrent
 import           Control.Monad
 import           Data.Attoparsec.Text
+import           Data.Monoid
 import qualified Data.Text as Tx
 import qualified Data.Text.IO as TxI
 import           Prelude hiding (takeWhile)
+import           System.Exit (ExitCode(..))
 import           System.IO
 import           System.Process
 import           Yi hiding (char)
