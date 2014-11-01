@@ -54,6 +54,7 @@ data IdentifierInfo = Keyword | Symbol | PrimitiveType
                     | Function FilePath Int
                     | Datatype FilePath Int
                     | InductiveConstructor FilePath Int
+                    | Bound FilePath Int
                     | IdentifierOther Tx.Text
                     deriving (Show, Eq)
 
@@ -78,7 +79,7 @@ err = takeText >>= error . Tx.unpack
 err' ∷ a → Parser b
 err' = const err
 
-identifier :: Parser Identifier
+identifier ∷ Parser Identifier
 identifier = parens $ do
   (s, (m, fp)) ← (,) <$> spn <~> idt
   return $ Identifier s m fp
@@ -95,6 +96,7 @@ identifier = parens $ do
           <|> withLoc Function "function"
           <|> withLoc Datatype "datatype"
           <|> withLoc InductiveConstructor "inductiveconstructor"
+          <|> withLoc Bound "bound"
           <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
 
     spn = mkRegion <$> (Point <$> decimal) <~> (Point <$> decimal)
@@ -202,8 +204,6 @@ data Complexity = Simplified deriving (Show, Eq)
 
 data IOTCM = IOTCM FilePath Activity Way Cmd
   deriving (Show, Eq)
-
---IOTCM "{{filepath}}" NonInteractive Indirect ( Cmd_goal_type Simplified {{goalIndex}} noRange "" )
 
 send ∷ Agda → IOTCM → IO ()
 send a = sendRaw a . serialise
