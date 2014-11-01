@@ -67,6 +67,7 @@ data Command = Info InfoType Message Bool
              | Identifiers [Identifier]
              | Status Tx.Text
              | ErrorGoto Line FilePath Col
+             | MakeCase [Tx.Text]
              | ParseFailure Tx.Text
              deriving (Show)
 
@@ -122,9 +123,12 @@ parens = delim (char '(') (char ')')
 quoted ∷ Parser a → Parser a
 quoted p = char '\'' *> p
 
--- | Parser an ELisp pair (naive).
+-- | Parser for an ELisp pair (naive).
 pair ∷ Parser a → Parser b → Parser (a, b)
 pair p p' = parens $ (,) <$> (p <* " . ") <*> p'
+
+skipSexpr ∷ Parser ()
+skipSexpr = void . parens $ takeWhile (/= ')')
 
 infixl 4 <~>
 -- | Like '(<*>)' but with a single spaces between the parsers, useful
@@ -142,6 +146,7 @@ command ∷ Parser Command
 command = skippingPrompt *> cmds <|> parseFailure
   where
     cmds = parens (info <|> hlClear <|> hlLoadAndDelete <|> status)
+           <|> mkCase
            <|> errorGoto
     parseFailure = ParseFailure <$> takeText
     info = Info <$> ("agda2-info-action " *> infoBfr) <~> str <~> bool
@@ -156,6 +161,9 @@ command = skippingPrompt *> cmds <|> parseFailure
     hlLoadAndDelete = HighlightLoadAndDelete . Tx.unpack
                       <$> ("agda2-highlight-load-and-delete-action " *> str)
     status = Status <$> ("agda2-status-action " *> str)
+    mkCase = let p = parens $ "agda2-make-case-action "
+                              *> quoted (parens $ str `sepBy` char ' ')
+             in MakeCase . snd <$> pair skipSexpr p
     errorGoto = do
       let ln = snd <$> pair (takeWhile (/= ' ')) decimal
           gt = parens $ "agda2-goto " *> quoted (pair str decimal)
@@ -194,7 +202,8 @@ test ∷ IO ()
 test = do
   ag ← runAgda >>= threaded parser
   send ag $ loadCmd testFile []
-  send ag $ goalTypeCmd testFile 0
+  -- send ag $ goalTypeCmd testFile 0
+  send ag $ caseCmd testFile 0 109 10 2 110 10 3 "x"
   threadDelay 3000000
   void $ killAgda ag
 
@@ -214,16 +223,36 @@ sendRaw a = hPutStrLn (_stdIn a)
 data Cmd where
   Cmd_load ∷ FilePath → [FilePath] → Cmd
   Cmd_goal_type ∷ Complexity → Int → Cmd
+  Cmd_make_case ∷ FilePath → Int → Int → Int → Int → Int → Int → Int → String
+                → Cmd
   deriving (Show, Eq)
 
 serialise ∷ IOTCM → String
-serialise fc@(IOTCM fp act w c) = case c of
+serialise fc@(IOTCM fp' act w c) = case c of
   Cmd_load _ _ → show fc
-  Cmd_goal_type cmp i → unwords ["IOTCM", show fp, show act, show w
+  Cmd_goal_type cmp i → unwords ["IOTCM", show fp', show act, show w
                                 , "(Cmd_goal_type", show cmp, show i
                                 , "noRange", "\"\")"
                                 ]
+  Cmd_make_case fp gi sch sr sc ech er ec cnt →
+    unwords [ "IOTCM", show fp, show act, show w, "(Cmd_make_case", show gi
+            , "(Range [Interval (Pn (Just (mkAbsolute", show fp <> "))"
+            , show sch, show sr, show sc <> ")(Pn (Just (mkAbsolute"
+            , show fp <> "))", show ech, show er, show ec <> ")])"
+            , show cnt <> ")"
+            ]
 
+caseCmd ∷ FilePath
+        → Int -- ^ Index of the goal
+        → Int -- ^ Start char index
+        → Int -- ^ Start Row
+        → Int -- ^ Start column
+        → Int -- ^ End char index
+        → Int -- ^ End row
+        → Int -- ^ End column
+        → String -- ^ Terms you want to split
+        → IOTCM
+caseCmd fp gi sch sr sc ech er ec cnt = IOTCM fp NonInteractive Indirect (Cmd_make_case fp gi sch sr sc ech er ec cnt)
 
 loadCmd ∷ FilePath → [FilePath] → IOTCM
 loadCmd fp fps = IOTCM fp NonInteractive Indirect (Cmd_load fp $ "." : fps)
