@@ -35,7 +35,7 @@ import qualified Data.Text as Tx
 import qualified Data.Text.Encoding as TxE
 import qualified Data.Text.IO as TxI
 import           Data.Typeable
-import           Prelude hiding (takeWhile)
+import           Prelude hiding (takeWhile, drop)
 import           System.Directory
 import           System.Exit (ExitCode(..))
 import           System.IO
@@ -49,7 +49,6 @@ import qualified Yi.Rope as R
 import           Yi.String
 import           Yi.Types (YiVariable, YiConfigVariable)
 
-
 data AgdaStyle = AgdaStyle
   { _agdaKeyword ∷ StyleName
   , _agdaSymbol ∷ StyleName
@@ -62,6 +61,8 @@ data AgdaStyle = AgdaStyle
   , _agdaUnsolvedMeta ∷ StyleName
   , _agdaPostulate ∷ StyleName
   , _agdaTerminationProblem ∷ StyleName
+  , _agdaError ∷ StyleName
+  , _agdaString ∷ StyleName
   } deriving (Typeable)
 
 
@@ -95,6 +96,8 @@ instance Default AgdaStyle where
                   , _agdaPostulate = fgColour 0x0000cd -- medium blue
                   , _agdaTerminationProblem = -- light salmon bg, black fg
                     bgColour 0xffa07a <> fgColour 0x000000
+                  , _agdaError = fgColour 0xff0000 -- red
+                  , _agdaString = fgColour 0xb22222 -- firebrick
                   }
 
 instance YiConfigVariable AgdaStyle
@@ -141,6 +144,8 @@ styleIdentifier as (Bound _ _) = _agdaBound as
 styleIdentifier as (Postulate _ _) = _agdaPostulate as
 styleIdentifier as (TerminationProblem _ _) = _agdaTerminationProblem as
 styleIdentifier as UnsolvedMeta = _agdaUnsolvedMeta as
+styleIdentifier as (ErrorI _ _ _ _) = _agdaError as
+styleIdentifier as StringI = _agdaString as
 styleIdentifier _ (IdentifierOther _) = defaultStyle
 
 sl ∷ AgdaStyle → StyleLexerASI () IdentifierInfo
@@ -364,6 +369,8 @@ data IdentifierInfo = Keyword | Symbol | PrimitiveType
                     | Postulate FilePath Int
                     | TerminationProblem FilePath Int
                     | UnsolvedMeta
+                    | ErrorI FilePath Line Col Tx.Text
+                    | StringI
                     deriving (Show, Eq)
 
 data Identifier = Identifier Region IdentifierInfo (Maybe FilePath)
@@ -399,14 +406,28 @@ identifier = parens $ do
       (_,fp,(fp',d)) ← (,,) <$> parens s <~> mfp
                        <~> pair (Tx.unpack <$> str) decimal
       return (c fp' d,fp)
+    errP = do
+      s ← parens "error" *> char ' ' *> str
+      let p ∷ Parser (FilePath, Int, Int, Tx.Text)
+          p = do
+            fp ← takeWhile (/= ':') <* char ':'
+            (ln, cl) ← (,) <$> (decimal <* char ',') <*> decimal
+            -- Stuff is escaped (notably newline) because ELisp.
+            i ← char '-' *> (decimal ∷ Parser Int) *> "\\n" *> takeText
+            return (Tx.unpack fp, ln, cl, i)
+      case parseOnly p s of
+       Left s' → fail s'
+       Right (fp, ln, cl, i) → return $ ErrorI fp ln cl i
+
     inductive = do
       (_,fp,p) ← (,,) <$> parens "inductiveconstructor" <~> mfp
-                 <~> optional (pair (Tx.unpack <$> str) decimal)
+                 <*> optional (char ' ' *> pair (Tx.unpack <$> str) decimal)
       return $ (InductiveConstructor p, fp)
     idt = (,) <$> parens (Keyword <$ "keyword") <~> mfp
           <|> (,) <$> parens (Symbol <$ "symbol") <~> mfp
           <|> (,) <$> parens (PrimitiveType <$ "primitivetype") <~> mfp
           <|> (,) <$> parens (UnsolvedMeta <$ "unsolvedmeta") <~> mfp
+          <|> (,) <$> parens (StringI <$ "string") <~> mfp
           <|> withLoc Module "module"
           <|> withLoc Function "function"
           <|> withLoc Datatype "datatype"
@@ -414,7 +435,8 @@ identifier = parens $ do
           <|> withLoc Bound "bound"
           <|> withLoc Postulate "postulate"
           <|> withLoc TerminationProblem "terminationproblem function"
-         <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
+          <|> (,) <$> errP <*> return Nothing
+          <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
 
     -- Emacs counts columns with different indexing so we need to
     -- compensate here
@@ -435,8 +457,12 @@ between p = delim p p
 delim ∷ Parser a → Parser b → Parser c → Parser c
 delim p p' p'' = p *> p'' <* p'
 
+-- | Parses out stuff between double quotes. Accounts for quotes
+-- escaped with a backslash.
 str ∷ Parser Tx.Text
-str = between (char '"') $ takeWhile (/= '"')
+str = do
+  let p = "\\\"" <|> Tx.pack . return <$> notChar '"'
+  char '"' *> (mconcat <$> many p) <* char '"'
 
 bool ∷ Parser Bool
 bool = False <$ "nil" <|> True <$ "t"
@@ -518,9 +544,9 @@ parseCommand = return . parseOnly (command <|> failRest) >=> \case
   Right (HighlightLoadAndDelete fp) → do
     fc ← TxI.readFile fp
     let r = parseOnly (Identifiers <$> identifiers) fc
-    -- case r of
-    --  Left _ → putStrLn $ Tx.unpack fc
-    --  _ → return ()
+    case r of
+      Left _ → putStrLn $ Tx.unpack fc
+      _ → return ()
     removeFile fp >> return r
   x → return x
 
@@ -539,7 +565,7 @@ test = do
   send ag $ loadCmd testFile []
   send ag $ goalTypeCmd testFile 0
   send ag $ caseCmd testFile 0 109 10 2 110 10 3 "x"
-  threadDelay 3000000
+  threadDelay 500000
   void $ killAgda ag
 
 data Activity = Interactive | NonInteractive deriving (Show, Eq)
