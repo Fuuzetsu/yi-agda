@@ -26,6 +26,7 @@ import           Control.Monad.Base
 import           Control.Monad.State
 import           Data.Attoparsec.Text
 import           Data.Binary
+import           Data.Bits
 import           Data.Default
 import           Data.Either
 import           Data.IORef
@@ -39,26 +40,89 @@ import           System.Exit (ExitCode(..))
 import           System.IO
 import           System.Process
 import           Yi hiding (char)
+import           Yi.Config.Simple.Types
 import           Yi.Keymap.Emacs.KillRing
 import           Yi.Lexer.Alex
 import           Yi.Modes
 import qualified Yi.Rope as R
 import           Yi.String
-import           Yi.Types (YiVariable)
+import           Yi.Types (YiVariable, YiConfigVariable)
 
-idToStyle ∷ IdentifierInfo → StyleName
-idToStyle Keyword = keywordStyle
-idToStyle PrimitiveType = builtinStyle
-idToStyle (Datatype _ _) = typeStyle
-idToStyle _ = defaultStyle
 
-sl ∷ StyleLexerASI () IdentifierInfo
-sl = StyleLexer { _tokenToStyle = idToStyle
-                , _styleLexer = commonLexer (const Nothing) ()
-                }
+data AgdaStyle = AgdaStyle
+  { _agdaKeyword ∷ StyleName
+  , _agdaSymbol ∷ StyleName
+  , _agdaPrimitiveType ∷ StyleName
+  , _agdaModule ∷ StyleName
+  , _agdaFunction ∷ StyleName
+  , _agdaDatatype ∷ StyleName
+  , _agdaInductiveConstructor ∷ StyleName
+  , _agdaBound ∷ StyleName
+  , _agdaUnsolvedMeta ∷ StyleName
+  , _agdaPostulate ∷ StyleName
+  , _agdaTerminationProblem ∷ StyleName
+  } deriving (Typeable)
+
+
+-- | Convenience function
+rgb :: Word32 -> Color
+rgb x = RGB (fi (x `shiftR` 16))
+            (fi (x `shiftR` 8))
+            (fi x)
+  where
+    fi = fromIntegral
+
+fgColour ∷ Word32 → b → Style
+fgColour x = const $ withFg (rgb x)
+
+bgColour ∷ Word32 → b → Style
+bgColour x = const $ withBg (rgb x)
+
+-- | Agda defaults are used except in places where there's already a
+-- matching attribute in 'UIStyle'.
+instance Default AgdaStyle where
+  def = AgdaStyle { _agdaKeyword = keywordStyle
+                  , _agdaSymbol = fgColour 0x404040 -- gray75
+                  , _agdaPrimitiveType = builtinStyle
+                  , _agdaModule = fgColour 0xa020f0 -- purple
+                  , _agdaFunction = fgColour 0x0000cd -- medium blue
+                  , _agdaDatatype = typeStyle
+                  , _agdaInductiveConstructor = fgColour 0x008b00 -- green4
+                  , _agdaBound = defaultStyle
+                  , _agdaUnsolvedMeta = -- yellow bg, black fg
+                      bgColour 0xffff00 <> fgColour 0x000000
+                  , _agdaPostulate = fgColour 0x0000cd -- medium blue
+                  , _agdaTerminationProblem = -- light salmon bg, black fg
+                    bgColour 0xffa07a <> fgColour 0x000000
+                  }
+
+instance YiConfigVariable AgdaStyle
+
+agdaStyle ∷ Field AgdaStyle
+agdaStyle = customVariable
+
+styleIdentifier ∷ AgdaStyle → IdentifierInfo → StyleName
+styleIdentifier as Keyword = _agdaKeyword as
+styleIdentifier as Symbol = _agdaSymbol as
+styleIdentifier as PrimitiveType = _agdaPrimitiveType as
+styleIdentifier as (Module _ _) = _agdaModule as
+styleIdentifier as (Function _ _) = _agdaFunction as
+styleIdentifier as (Datatype _ _) = _agdaDatatype as
+styleIdentifier as (InductiveConstructor _) = _agdaInductiveConstructor as
+styleIdentifier as (Bound _ _) = _agdaBound as
+styleIdentifier as (Postulate _ _) = _agdaPostulate as
+styleIdentifier as (TerminationProblem _ _) = _agdaTerminationProblem as
+styleIdentifier as UnsolvedMeta = _agdaUnsolvedMeta as
+styleIdentifier _ (IdentifierOther _) = defaultStyle
+--styleIdentifier _ _ = defaultStyle
+
+sl ∷ AgdaStyle → StyleLexerASI () IdentifierInfo
+sl st = StyleLexer { _tokenToStyle = styleIdentifier st
+                   , _styleLexer = commonLexer (const Nothing) ()
+                   }
 
 agdaMode ∷ TokenBasedMode IdentifierInfo
-agdaMode = mkAgdaMode sl
+agdaMode = mkAgdaMode $ sl def
 
 -- | Re-make the Agda mode: this allows us to cheat and when we want
 -- to slide in a new lexer, we remake the whole thing.
@@ -74,7 +138,8 @@ loadCurrentBuffer = withCurrentBuffer (gets file) >>= \case
   Just fp → do
     b ← withCurrentBuffer $ gets id
     d ← getAgda >> getEditorDyn
-    sendAgda' (runCommands b) . loadCmd fp . _agdaIncludeDirs $ d
+    fwriteBufferE (bkey b) -- save before loading in the file
+    sendAgda' (runCommands b) . loadCmd fp $ _agdaIncludeDirs d
 
 splitCase ∷ YiM ()
 splitCase = withCurrentBuffer (gets file) >>= \case
@@ -89,12 +154,13 @@ splitCase = withCurrentBuffer (gets file) >>= \case
 runCommands ∷ FBuffer → [Command] → YiM ()
 runCommands _ [] = return ()
 runCommands b (Info _ m _:cs) = printMsg m >> runCommands b cs
-runCommands b (Status m:cs) = printMsg m >> runCommands b cs
-runCommands _ (ErrorGoto ln fp cl:_) =
+runCommands b (Status m:cs) | Tx.null m = runCommands b cs
+                            | otherwise = printMsg m >> runCommands b cs
+runCommands _ (ErrorGoto _ fp pnt:_) =
   -- TODO: It seems we should delay this until we processed all other
   -- commands to: don't want to miss out on highlighting because a
   -- goto came first.
-  openingNewFile fp $ moveToLineColB ln cl
+  openingNewFile fp $ moveTo (Point pnt)
 -- Insert replacements at point
 runCommands b (MakeCase ls:cs) = do
   withGivenBuffer (bkey b) . savingPointB $ do
@@ -108,20 +174,19 @@ runCommands b (HighlightClear:cs) = do
 runCommands b a@(Identifiers _:_) = do
   let allIds = concat [ i | Identifiers i ← a ]
       rest = filter (\case { Identifiers _ → False; _ → True }) a
-  _ ← withGivenBuffer (bkey b) $ mapM (addOverlayB . makeOverlay) allIds
-      -- let oldKm = withMode0 modeKeymap b
-      -- setMode $ mkAgdaMode (sl & styleLexer .~ commonLexer fetch ())
-      --         & modeKeymapA .~ oldKm
-
+  overlays ← withEditor $ mapM makeOverlay allIds
+  withGivenBuffer (bkey b) $ mapM_ addOverlayB overlays
   runCommands b rest
 runCommands b (ParseFailure t:cs) = printMsg t >> runCommands b cs
 runCommands b (HighlightLoadAndDelete fp:cs) =
   printMsg ("Somehow didn't read in " <> Tx.pack fp) >> runCommands b cs
 
-
 -- | Turns identifiers Agda tells us about to colour overlays.
-makeOverlay ∷ Identifier → Overlay
-makeOverlay (Identifier r i _) = mkOverlay UserLayer r (idToStyle i)
+--
+-- Uses current 'agdaStyle'.
+makeOverlay ∷ Identifier → EditorM Overlay
+makeOverlay (Identifier r i _) =
+  agdaStyle `views` \st → mkOverlay UserLayer r (styleIdentifier st i)
 
 -- | Buffer used for process communication between Yi and Agda. To me
 -- it seems like the interface isn't flexible enough.
@@ -170,8 +235,12 @@ startAgda = getEditorDyn >>= \case
   AgdaBuffer Nothing → do
     AgdaPath binaryPath ← getEditorDyn
     AgdaExtraFlags extraFlags ← getEditorDyn
+    cb ← withCurrentBuffer $ gets bkey
     b ← startSubprocess binaryPath
           (extraFlags <> ["--interaction"]) handleExit
+    -- Switch back to the buffer we were in, startSubprocess really
+    -- shouldn't switch for us.
+    withEditor $ switchToBufferE cb
     putEditorDyn (AgdaBuffer $ Just b) >> return b
 
  where
@@ -203,10 +272,17 @@ sendAgdaRaw f s = getEditorDyn >>= \case
           end ← betweenB (Point $ i - Tx.length promptTxt) (Point i)
           return $ if R.toText end == promptTxt then Just i else Nothing
 
+        -- Try set number of times before announcing Agda is not ready
+        -- with a small wait between them, currently 10ms.
+        ready ∷ Int → YiM (Either Tx.Text Int)
+        ready n = withGivenBuffer b endIsPrompt >>= \case
+          Nothing | n > 0 → liftBase (threadDelay 20000) >> ready (n - 1)
+                  | otherwise →
+                      return $ Left "Agda is not ready, not sending command"
+          Just i → return $ Right i
+
     liftBase . putStrLn $ "Sending: " <> s
-    t ← withGivenBuffer b $ endIsPrompt >>= return . \case
-      Nothing → Left "Agda is not ready, not sending command"
-      Just i → Right i
+    t ← ready 10
 
     case t of
      Left m → printMsg m
@@ -226,11 +302,9 @@ sendAgdaRaw f s = getEditorDyn >>= \case
              Just nbfs → when (nbfs /= bfs) $ do
                liftBase $ writeIORef ior False
                s' ← R.lines <$> wb (betweenB (Point bfs) (Point nbfs))
+               liftBase $ putStrLn (R.toString $ R.unlines s')
                cs ← fmap rights . liftBase $ mapM (parseCommand . R.toText) s'
                void $ f cs
-               ems ← R.toString <$> withGivenBuffer b elemsB
-               liftBase $ putStrLn ems
-
        void $ forkAction terminate MustRefresh loop
 
 testFile ∷ FilePath
@@ -256,9 +330,12 @@ data IdentifierInfo = Keyword | Symbol | PrimitiveType
                     | Module FilePath Int
                     | Function FilePath Int
                     | Datatype FilePath Int
-                    | InductiveConstructor FilePath Int
+                    | InductiveConstructor (Maybe (FilePath, Int))
                     | Bound FilePath Int
                     | IdentifierOther Tx.Text
+                    | Postulate FilePath Int
+                    | TerminationProblem FilePath Int
+                    | UnsolvedMeta
                     deriving (Show, Eq)
 
 data Identifier = Identifier Region IdentifierInfo (Maybe FilePath)
@@ -293,15 +370,22 @@ identifier = parens $ do
       (_,fp,(fp',d)) ← (,,) <$> parens s <~> mfp
                        <~> pair (Tx.unpack <$> str) decimal
       return (c fp' d,fp)
+    inductive = do
+      (_,fp,p) ← (,,) <$> parens "inductiveconstructor" <~> mfp
+                 <~> optional (pair (Tx.unpack <$> str) decimal)
+      return $ (InductiveConstructor p, fp)
     idt = (,) <$> parens (Keyword <$ "keyword") <~> mfp
           <|> (,) <$> parens (Symbol <$ "symbol") <~> mfp
           <|> (,) <$> parens (PrimitiveType <$ "primitivetype") <~> mfp
+          <|> (,) <$> parens (UnsolvedMeta <$ "unsolvedmeta") <~> mfp
           <|> withLoc Module "module"
           <|> withLoc Function "function"
           <|> withLoc Datatype "datatype"
-          <|> withLoc InductiveConstructor "inductiveconstructor"
+          <|> inductive
           <|> withLoc Bound "bound"
-          <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
+          <|> withLoc Postulate "postulate"
+          <|> withLoc TerminationProblem "terminationproblem function"
+         <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
 
     -- Emacs counts columns with different indexing so we need to
     -- compensate here
@@ -378,8 +462,8 @@ command = skippingPrompt *> cmds <|> parseFailure
     errorGoto = do
       let ln = snd <$> pair (takeWhile (/= ' ')) decimal
           gt = parens $ "agda2-goto " *> quoted (pair str decimal)
-      (l, (f, c)) ← pair ln gt
-      return $ ErrorGoto l (Tx.unpack f) c
+      (l, (f, pnt)) ← pair ln gt
+      return $ ErrorGoto l (Tx.unpack f) pnt
 
 instance Show Agda where
   show (Agda i o e _ ts) = "Agda " ++ unwords [show i, show o, show e, show ts]
@@ -399,7 +483,11 @@ runAgda =
 parseCommand ∷ Tx.Text → IO (Either String Command)
 parseCommand = return . parseOnly (command <|> failRest) >=> \case
   Right (HighlightLoadAndDelete fp) → do
-    r ← TxI.readFile fp >>= return . parseOnly (Identifiers <$> identifiers)
+    fc ← TxI.readFile fp
+    let r = parseOnly (Identifiers <$> identifiers) fc
+    -- case r of
+    --  Left _ → putStrLn $ Tx.unpack fc
+    --  _ → return ()
     removeFile fp >> return r
   x → return x
 
