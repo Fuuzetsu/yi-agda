@@ -32,6 +32,7 @@ import           Data.Either
 import           Data.IORef
 import           Data.Monoid
 import qualified Data.Text as Tx
+import qualified Data.Text.Encoding as TxE
 import qualified Data.Text.IO as TxI
 import           Data.Typeable
 import           Prelude hiding (takeWhile)
@@ -98,6 +99,33 @@ instance Default AgdaStyle where
 
 instance YiConfigVariable AgdaStyle
 
+data GoalInfo = GoalInfo { _goalIndex ∷ !Int
+                         , _goalType ∷ Tx.Text
+                         } deriving (Show, Eq, Typeable)
+
+getText ∷ Get Tx.Text
+getText = TxE.decodeUtf8 <$> Data.Binary.get
+
+putText ∷ Tx.Text → Put
+putText = Data.Binary.put . TxE.encodeUtf8
+
+instance Binary GoalInfo where
+  put (GoalInfo i gt) = Data.Binary.put i *> putText gt
+  get = GoalInfo <$> Data.Binary.get <*> getText
+
+data AgdaState = AgdaState
+  { _agdaGoals ∷ [GoalInfo]
+  } deriving (Show, Eq, Typeable)
+
+instance Default AgdaState where
+  def = AgdaState { _agdaGoals = mempty }
+
+instance Binary AgdaState where
+  put (AgdaState gs) = Data.Binary.put gs
+  get = AgdaState <$> Data.Binary.get
+
+instance YiVariable AgdaState
+
 agdaStyle ∷ Field AgdaStyle
 agdaStyle = customVariable
 
@@ -114,7 +142,6 @@ styleIdentifier as (Postulate _ _) = _agdaPostulate as
 styleIdentifier as (TerminationProblem _ _) = _agdaTerminationProblem as
 styleIdentifier as UnsolvedMeta = _agdaUnsolvedMeta as
 styleIdentifier _ (IdentifierOther _) = defaultStyle
---styleIdentifier _ _ = defaultStyle
 
 sl ∷ AgdaStyle → StyleLexerASI () IdentifierInfo
 sl st = StyleLexer { _tokenToStyle = styleIdentifier st
@@ -180,6 +207,7 @@ runCommands b a@(Identifiers _:_) = do
 runCommands b (ParseFailure t:cs) = printMsg t >> runCommands b cs
 runCommands b (HighlightLoadAndDelete fp:cs) =
   printMsg ("Somehow didn't read in " <> Tx.pack fp) >> runCommands b cs
+runCommands b (GoalAction _:cs) = runCommands b cs
 
 -- | Turns identifiers Agda tells us about to colour overlays.
 --
@@ -349,6 +377,7 @@ data Command = Info InfoType Message Bool
              | ErrorGoto Line FilePath Col
              | MakeCase [Tx.Text]
              | ParseFailure Tx.Text
+             | GoalAction [Int]
              deriving (Show)
 
 identifiers ∷ Parser [Identifier]
@@ -443,6 +472,7 @@ command = skippingPrompt *> cmds <|> parseFailure
     cmds = parens (info <|> hlClear <|> hlLoadAndDelete <|> status)
            <|> mkCase
            <|> errorGoto
+           <|> mkGoalAct
     parseFailure = ParseFailure <$> takeText
     info = Info <$> ("agda2-info-action " *> infoBfr) <~> str <~> bool
     infoBfr = between (char '"') $
@@ -456,6 +486,9 @@ command = skippingPrompt *> cmds <|> parseFailure
     hlLoadAndDelete = HighlightLoadAndDelete . Tx.unpack
                       <$> ("agda2-highlight-load-and-delete-action " *> str)
     status = Status <$> ("agda2-status-action " *> str)
+    mkGoalAct = let p = parens $ "agda2-goals-action "
+                              *> quoted (parens $ decimal `sepBy` char ' ')
+             in GoalAction . snd <$> pair skipSexpr p
     mkCase = let p = parens $ "agda2-make-case-action "
                               *> quoted (parens $ str `sepBy` char ' ')
              in MakeCase . snd <$> pair skipSexpr p
