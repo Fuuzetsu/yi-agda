@@ -1,6 +1,9 @@
+{-# LANGUAGE DeriveDataTypeable #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE UnicodeSyntax #-}
 {-# OPTIONS_HADDOCK show-extensions #-}
@@ -18,17 +21,217 @@ module Yi.Mode.Agda where
 
 import           Control.Applicative
 import           Control.Concurrent
-import           Control.Monad
+import           Control.Lens hiding (act)
+import           Control.Monad.Base
+import           Control.Monad.State
 import           Data.Attoparsec.Text
+import           Data.Binary
+import           Data.Default
+import           Data.Either
+import           Data.IORef
 import           Data.Monoid
 import qualified Data.Text as Tx
 import qualified Data.Text.IO as TxI
+import           Data.Typeable
 import           Prelude hiding (takeWhile)
+import           System.Directory
 import           System.Exit (ExitCode(..))
 import           System.IO
 import           System.Process
 import           Yi hiding (char)
+import           Yi.Keymap.Emacs.KillRing
+import           Yi.Lexer.Alex
+import           Yi.Modes
+import qualified Yi.Rope as R
+import           Yi.String
+import           Yi.Types (YiVariable)
 
+idToStyle ∷ IdentifierInfo → StyleName
+idToStyle Keyword = keywordStyle
+idToStyle PrimitiveType = builtinStyle
+idToStyle (Datatype _ _) = typeStyle
+idToStyle _ = defaultStyle
+
+sl ∷ StyleLexerASI () IdentifierInfo
+sl = StyleLexer { _tokenToStyle = idToStyle
+                , _styleLexer = commonLexer (const Nothing) ()
+                }
+
+agdaMode ∷ TokenBasedMode IdentifierInfo
+agdaMode = mkAgdaMode sl
+
+-- | Re-make the Agda mode: this allows us to cheat and when we want
+-- to slide in a new lexer, we remake the whole thing.
+mkAgdaMode ∷ Show (l s) ⇒ StyleLexer l s t i -> TokenBasedMode t
+mkAgdaMode x = styleMode x
+  & modeNameA .~ "agda"
+  & modeAppliesA .~ anyExtension [ "lagda", "agda" ]
+  & modeToggleCommentSelectionA .~ Just (toggleCommentB "--")
+
+loadCurrentBuffer ∷ YiM ()
+loadCurrentBuffer = withCurrentBuffer (gets file) >>= \case
+  Nothing → printMsg "Current buffer is not associated with a file."
+  Just fp → do
+    b ← withCurrentBuffer $ gets id
+    d ← getAgda >> getEditorDyn
+    sendAgda' (runCommands b) . loadCmd fp . _agdaIncludeDirs $ d
+
+splitCase ∷ YiM ()
+splitCase = withCurrentBuffer (gets file) >>= \case
+  Nothing → printMsg "Current buffer is not associated with a file."
+  Just fp → do
+    (Point p, c, l, cr) ←
+      withCurrentBuffer $ (,,,) <$> pointB <*> curCol <*> curLn <*> readB
+    b ← withCurrentBuffer $ gets id
+    sendAgda' (runCommands b) $ caseCmd fp 0 p l c (p + 1) l (c + 1) [cr]
+
+-- | Given commands, actually execute them in the editor
+runCommands ∷ FBuffer → [Command] → YiM ()
+runCommands _ [] = return ()
+runCommands b (Info _ m _:cs) = printMsg m >> runCommands b cs
+runCommands b (Status m:cs) = printMsg m >> runCommands b cs
+runCommands _ (ErrorGoto ln fp cl:_) =
+  -- TODO: It seems we should delay this until we processed all other
+  -- commands to: don't want to miss out on highlighting because a
+  -- goto came first.
+  openingNewFile fp $ moveToLineColB ln cl
+-- Insert replacements at point
+runCommands b (MakeCase ls:cs) = do
+  withGivenBuffer (bkey b) . savingPointB $ do
+    pointB >>= solPointB >>= moveTo
+    killRestOfLine
+    insertN (R.fromText $ Tx.unlines ls)
+  runCommands b cs
+runCommands b (HighlightClear:cs) = do
+  withGivenBuffer (bkey b) $ delOverlayLayerB UserLayer
+  runCommands b cs
+runCommands b a@(Identifiers _:_) = do
+  let allIds = concat [ i | Identifiers i ← a ]
+      rest = filter (\case { Identifiers _ → False; _ → True }) a
+  _ ← withGivenBuffer (bkey b) $ mapM (addOverlayB . makeOverlay) allIds
+      -- let oldKm = withMode0 modeKeymap b
+      -- setMode $ mkAgdaMode (sl & styleLexer .~ commonLexer fetch ())
+      --         & modeKeymapA .~ oldKm
+
+  runCommands b rest
+runCommands b (ParseFailure t:cs) = printMsg t >> runCommands b cs
+runCommands b (HighlightLoadAndDelete fp:cs) =
+  printMsg ("Somehow didn't read in " <> Tx.pack fp) >> runCommands b cs
+
+
+-- | Turns identifiers Agda tells us about to colour overlays.
+makeOverlay ∷ Identifier → Overlay
+makeOverlay (Identifier r i _) = mkOverlay UserLayer r (idToStyle i)
+
+-- | Buffer used for process communication between Yi and Agda. To me
+-- it seems like the interface isn't flexible enough.
+newtype AgdaBuffer = AgdaBuffer { _agdaBuffer ∷ Maybe BufferRef }
+                   deriving (Show, Eq, Typeable)
+
+instance Default AgdaBuffer where
+  def = AgdaBuffer Nothing
+
+-- | Path to the Agda binary.
+newtype AgdaPath = AgdaPath { _agdaPath ∷ FilePath }
+                 deriving (Show, Eq, Typeable)
+
+instance Default AgdaPath where
+  def = AgdaPath "agda"
+
+-- | Directories to pass to Agda commands, pointing at libraries needed.
+newtype AgdaIncludeDirs = AgdaIncludeDirs { _agdaIncludeDirs ∷ [FilePath] }
+                        deriving (Show, Eq, Typeable)
+
+-- | By default, we point to the the "." directory.
+instance Default AgdaIncludeDirs where
+  def = AgdaIncludeDirs ["."]
+
+-- | Extra flags to pass to Agda when it starts. "--interaction" is
+-- always used regardless and passed as the last element.
+newtype AgdaExtraFlags = AgdaExtraFlags { _agdaExtraFlags ∷ [String] }
+                       deriving (Show, Eq, Typeable)
+
+-- | By default no extra flags are passed in
+instance Default AgdaExtraFlags where
+  def = AgdaExtraFlags []
+
+deriving instance Binary AgdaBuffer
+deriving instance Binary AgdaPath
+deriving instance Binary AgdaIncludeDirs
+deriving instance Binary AgdaExtraFlags
+instance YiVariable AgdaBuffer
+instance YiVariable AgdaPath
+instance YiVariable AgdaIncludeDirs
+instance YiVariable AgdaExtraFlags
+
+startAgda ∷ YiM BufferRef
+startAgda = getEditorDyn >>= \case
+  AgdaBuffer (Just b) → printMsg "Agda already started" >> return b
+  AgdaBuffer Nothing → do
+    AgdaPath binaryPath ← getEditorDyn
+    AgdaExtraFlags extraFlags ← getEditorDyn
+    b ← startSubprocess binaryPath
+          (extraFlags <> ["--interaction"]) handleExit
+    putEditorDyn (AgdaBuffer $ Just b) >> return b
+
+ where
+   handleExit (Right ExitSuccess) = printMsg "Agda closed gracefully"
+   handleExit (Right (ExitFailure x)) = printMsg $ "Agda quit with: " <> showT x
+   handleExit (Left e) = printMsg $ "Exception in the Agda process: " <> showT e
+
+getAgda ∷ YiM BufferRef
+getAgda = getEditorDyn >>= \case
+  AgdaBuffer (Just b) → return b
+  AgdaBuffer Nothing → startAgda
+
+sendAgda ∷ IOTCM → YiM ()
+sendAgda = sendAgda' (const $ return ())
+
+sendAgda' ∷ ([Command] → YiM a) → IOTCM → YiM ()
+sendAgda' f = sendAgdaRaw f . serialise
+
+-- | This monster sends a command to Agda, waits until a new prompt is
+-- spotted, parses everything in between and runs user-supplied
+-- function on the results.
+sendAgdaRaw ∷ ([Command] → YiM a) → String → YiM ()
+sendAgdaRaw f s = getEditorDyn >>= \case
+  AgdaBuffer Nothing → printMsg "Agda is not running."
+  AgdaBuffer (Just b) → do
+    let endIsPrompt ∷ BufferM (Maybe Int)
+        endIsPrompt = do
+          Point i ← sizeB
+          end ← betweenB (Point $ i - Tx.length promptTxt) (Point i)
+          return $ if R.toText end == promptTxt then Just i else Nothing
+
+    liftBase . putStrLn $ "Sending: " <> s
+    t ← withGivenBuffer b $ endIsPrompt >>= return . \case
+      Nothing → Left "Agda is not ready, not sending command"
+      Just i → Right i
+
+    case t of
+     Left m → printMsg m
+     Right bfs → do
+       ior ← liftBase $ newIORef True
+       sendToProcess b (s <> "\n")
+       let terminate = do
+             c ← readIORef ior
+             if c then threadDelay 10000 >> return True else return False
+
+           wb ∷ MonadEditor m ⇒ BufferM a → m a
+           wb = withGivenBuffer b
+
+           loop ∷ YiM ()
+           loop = wb endIsPrompt >>= \case
+             Nothing → return ()
+             Just nbfs → when (nbfs /= bfs) $ do
+               liftBase $ writeIORef ior False
+               s' ← R.lines <$> wb (betweenB (Point bfs) (Point nbfs))
+               cs ← fmap rights . liftBase $ mapM (parseCommand . R.toText) s'
+               void $ f cs
+               ems ← R.toString <$> withGivenBuffer b elemsB
+               liftBase $ putStrLn ems
+
+       void $ forkAction terminate MustRefresh loop
 
 testFile ∷ FilePath
 testFile = "/tmp/DTPiA.agda"
@@ -100,10 +303,18 @@ identifier = parens $ do
           <|> withLoc Bound "bound"
           <|> (,) <$> parens (IdentifierOther <$> takeWhile (/= ')')) <~> mfp
 
-    spn = mkRegion <$> (Point <$> decimal) <~> (Point <$> decimal)
+    -- Emacs counts columns with different indexing so we need to
+    -- compensate here
+    spn = mkRegion <$> (Point . pred <$> decimal) <~> (Point . pred <$> decimal)
 
 skippingPrompt ∷ Parser ()
-skippingPrompt = void . optional $ "Agda2> " *> skipSpace
+skippingPrompt = void $ optional prompt
+
+promptTxt ∷ Tx.Text
+promptTxt = "Agda2> "
+
+prompt ∷ Parser Tx.Text
+prompt = string promptTxt <* skipSpace
 
 between ∷ Parser a → Parser b → Parser b
 between p = delim p p
@@ -185,10 +396,11 @@ runAgda =
       hSetBuffering sin' NoBuffering
       return $ Agda sin' sout serr ph mempty
 
-parseCommand ∷ String → IO (Either String Command)
-parseCommand = return . parseOnly (command <|> failRest) . Tx.pack >=> \case
-  Right (HighlightLoadAndDelete fp) →
-    TxI.readFile fp >>= return . parseOnly (Identifiers <$> identifiers)
+parseCommand ∷ Tx.Text → IO (Either String Command)
+parseCommand = return . parseOnly (command <|> failRest) >=> \case
+  Right (HighlightLoadAndDelete fp) → do
+    r ← TxI.readFile fp >>= return . parseOnly (Identifiers <$> identifiers)
+    removeFile fp >> return r
   x → return x
 
 threaded ∷ (Agda → IO ()) → Agda → IO Agda
@@ -196,13 +408,15 @@ threaded f a = do
   forkIO (f a) >>= \t → return $ a { _threads = t : _threads a }
 
 parser ∷ Agda → IO ()
-parser ag = forever $ hGetLine (_stdOut ag) >>= parseCommand >>= print
+parser ag = forever $ do
+  l ← hGetContents (_stdOut ag)
+  mapM_ (parseCommand . Tx.pack >=> print) (lines l)
 
 test ∷ IO ()
 test = do
   ag ← runAgda >>= threaded parser
   send ag $ loadCmd testFile []
-  -- send ag $ goalTypeCmd testFile 0
+  send ag $ goalTypeCmd testFile 0
   send ag $ caseCmd testFile 0 109 10 2 110 10 3 "x"
   threadDelay 3000000
   void $ killAgda ag
@@ -252,10 +466,11 @@ caseCmd ∷ FilePath
         → Int -- ^ End column
         → String -- ^ Terms you want to split
         → IOTCM
-caseCmd fp gi sch sr sc ech er ec cnt = IOTCM fp NonInteractive Indirect (Cmd_make_case fp gi sch sr sc ech er ec cnt)
+caseCmd fp gi sch sr sc ech er ec cnt =
+  IOTCM fp NonInteractive Indirect (Cmd_make_case fp gi sch sr sc ech er ec cnt)
 
 loadCmd ∷ FilePath → [FilePath] → IOTCM
-loadCmd fp fps = IOTCM fp NonInteractive Indirect (Cmd_load fp $ "." : fps)
+loadCmd fp fps = IOTCM fp NonInteractive Indirect (Cmd_load fp fps)
 
 goalTypeCmd ∷ FilePath
             → Int -- ^ Goal index
