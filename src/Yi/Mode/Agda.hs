@@ -201,7 +201,7 @@ runCommands b (MakeCase ls:cs) = do
     insertN (R.fromText $ Tx.unlines ls)
   runCommands b cs
 runCommands b (HighlightClear:cs) = do
-  withGivenBuffer (bkey b) $ delOverlayLayerB UserLayer
+  withGivenBuffer (bkey b) $ delOverlaysOfOwnerB "agda"
   runCommands b cs
 runCommands b a@(Identifiers _:_) = do
   let allIds = concat [ i | Identifiers i ← a ]
@@ -219,7 +219,7 @@ runCommands b (GoalAction _:cs) = runCommands b cs
 -- Uses current 'agdaStyle'.
 makeOverlay ∷ Identifier → EditorM Overlay
 makeOverlay (Identifier r i _) =
-  agdaStyle `views` \st → mkOverlay UserLayer r (styleIdentifier st i)
+  agdaStyle `views` \st → mkOverlay "agda" r (styleIdentifier st i) ""
 
 -- | Buffer used for process communication between Yi and Agda. To me
 -- it seems like the interface isn't flexible enough.
