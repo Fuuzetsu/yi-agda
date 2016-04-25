@@ -28,7 +28,7 @@ library
     , process
     , text
     , transformers-base
-    , yi >= 0.11.0
+    , yi >= 0.11.2
     , yi-language
     , yi-rope
 
